@@ -47,6 +47,18 @@ enum Command {
     },
     /// Save the current repo state as a tree object
     WriteTree,
+    /// Commit the given tree
+    CommitTree {
+        #[arg(value_parser = parse_key)]
+        /// The key of the tree to commit
+        tree: Key,
+        #[arg(short, default_value_t)]
+        /// Message for the commit
+        message: String,
+        #[arg(short, value_parser = parse_key, id = "PARENT")]
+        /// The parent commit(s)
+        parents: Vec<Key>,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -76,6 +88,11 @@ fn main() -> Result<()> {
         Command::HashObject { file, write } => hash_object(file, write)?,
         Command::LsTree { key, name_only } => ls_tree(key, name_only)?,
         Command::WriteTree => write_tree()?,
+        Command::CommitTree {
+            tree,
+            parents,
+            message,
+        } => commit_tree(tree, parents, message)?,
     }
 
     Ok(())
@@ -92,15 +109,15 @@ fn init() -> Result<()> {
 }
 
 fn cat_file(key: Key) -> Result<()> {
-    let Object { kind, size, reader } = open_object(key).context("Failed to read object file")?;
+    let Object { kind, size, reader } = get_object(key).context("Failed to get object")?;
 
     match kind {
-        ObjectKind::Blob => {
+        ObjectKind::Blob | ObjectKind::Commit => {
             if io::copy(&mut reader.take(size), &mut io::stdout())? != size {
                 return Err(eyre!("Short read"));
             }
         }
-        kind => return Err(eyre!("Expected Blob, got {kind:?}")),
+        kind => return Err(eyre!("Cannot cat {kind:?}")),
     }
 
     Ok(())
@@ -109,9 +126,9 @@ fn cat_file(key: Key) -> Result<()> {
 fn hash_object(file: PathBuf, write: bool) -> Result<()> {
     let data = fs::read(file).context("Failed to read file")?;
     let key = if write {
-        add_blob(data).context("Failed to create blob")?
+        add_object(ObjectKind::Blob, data).context("Failed to create blob")?
     } else {
-        make_blob(data).0
+        make_object(ObjectKind::Blob, data).0
     };
 
     println!("{}", hex::encode(key));
@@ -120,8 +137,11 @@ fn hash_object(file: PathBuf, write: bool) -> Result<()> {
 }
 
 fn ls_tree(key: Key, name_only: bool) -> Result<()> {
-    let Object { kind, size, reader } = open_object(key).context("Failed to open object file")?;
-    let mut reader = reader.take(size);
+    let Object {
+        kind,
+        size,
+        mut reader,
+    } = get_object(key).context("Failed to get tree")?;
 
     match kind {
         ObjectKind::Tree => {
@@ -139,7 +159,12 @@ fn ls_tree(key: Key, name_only: bool) -> Result<()> {
                             Err(eyre!("Short read"))
                         };
                     }
-                    n => read += n,
+                    n => {
+                        read += n;
+                        if read as u64 >= size {
+                            break Ok(());
+                        }
+                    }
                 }
                 prefix.pop();
 
@@ -184,7 +209,7 @@ fn write_tree() -> Result<()> {
     let root = get_root().context("Failed to find repo root")?;
 
     let key = write_tree_inner(&root, &Gitignore::new(root.join(".gitignore")).0)
-        .context("Failed to create tree object")?;
+        .context("Failed to create tree")?;
 
     println!("{}", hex::encode(key));
     Ok(())
@@ -235,7 +260,10 @@ fn write_tree_inner(path: &Path, ignore: &Gitignore) -> io::Result<Key> {
         let (mode, key) = if filetype.is_symlink() {
             (
                 "120000",
-                add_blob(fs::read_link(path)?.into_os_string().into_encoded_bytes())?,
+                add_object(
+                    ObjectKind::Blob,
+                    fs::read_link(path)?.into_os_string().into_encoded_bytes(),
+                )?,
             )
         } else if filetype.is_dir() {
             ("40000", write_tree_inner(&path, ignore)?)
@@ -245,7 +273,7 @@ fn write_tree_inner(path: &Path, ignore: &Gitignore) -> io::Result<Key> {
             } else {
                 "100644"
             };
-            (mode, add_blob(fs::read(path)?)?)
+            (mode, add_object(ObjectKind::Blob, fs::read(path)?)?)
         };
         let name = entry.file_name();
 
@@ -255,14 +283,38 @@ fn write_tree_inner(path: &Path, ignore: &Gitignore) -> io::Result<Key> {
         contents.extend(key);
     }
 
-    let mut out = Vec::new();
-    out.extend(format!("tree {}\0", contents.len()).bytes());
-    out.extend(contents);
-    let key = Sha1::digest(&out).into();
+    add_object(ObjectKind::Tree, contents)
+}
 
-    new_object(key)?.write_all(&out)?;
+fn commit_tree(tree: Key, parents: Vec<Key>, message: String) -> Result<()> {
+    if !object_exists(tree).context("Failed to check if tree exists")? {
+        return Err(eyre!("Given tree does not exist"));
+    }
 
-    Ok(key)
+    let mut contents = format!("tree {}\n", hex::encode(tree));
+    for parent in parents {
+        if !object_exists(parent).context("Failed to check if parent exists")? {
+            return Err(eyre!("Given parent does not exist"));
+        }
+        contents += &format!("parent {}\n", hex::encode(parent));
+    }
+    contents += &format!("\n{message}");
+
+    let key =
+        add_object(ObjectKind::Commit, contents.into_bytes()).context("Failed to create commit")?;
+
+    println!("{}", hex::encode(key));
+
+    Ok(())
+}
+
+fn object_exists(key: Key) -> io::Result<bool> {
+    let key = hex::encode(key);
+    Ok(get_root()?
+        .join(".jit/objects")
+        .join(&key[..2])
+        .join(&key[2..])
+        .exists())
 }
 
 struct Object {
@@ -297,7 +349,7 @@ enum ReadObjectError {
     InvalidHeader,
 }
 
-fn open_object(key: Key) -> Result<Object, ReadObjectError> {
+fn get_object(key: Key) -> Result<Object, ReadObjectError> {
     let key = hex::encode(key);
 
     let mut reader = BufReader::new(ZlibDecoder::new(File::open(
@@ -314,39 +366,37 @@ fn open_object(key: Key) -> Result<Object, ReadObjectError> {
     let Some((kind, size)) = prefix_text.split_once(' ') else {
         return Err(ReadObjectError::InvalidHeader);
     };
+    let size = size.parse()?;
 
     Ok(Object {
         kind: ObjectKind::from_str(kind, false).map_err(ReadObjectError::UnknownKind)?,
-        size: size.parse()?,
+        size,
         reader,
     })
 }
 
-fn new_object(key: Key) -> io::Result<ZlibEncoder<File>> {
-    let key = hex::encode(key);
-    let objects = get_root()?.join(".jit/objects");
+fn make_object(kind: ObjectKind, contents: Vec<u8>) -> (Key, Vec<u8>) {
+    let mut out = format!(
+        "{} {}\0",
+        format!("{kind:?}").to_lowercase(),
+        contents.len()
+    )
+    .into_bytes();
+    out.extend(contents);
 
-    fs::create_dir_all(objects.join(&key[..2]))?;
-    File::create_new(objects.join(&key[..2]).join(&key[2..]))
-        .map(|f| ZlibEncoder::new(f, Default::default()))
+    (Sha1::digest(&out).0, out)
 }
 
-fn make_blob(data: Vec<u8>) -> (Key, Vec<u8>) {
-    let mut out = format!("blob {}\0", data.len()).into_bytes();
-
-    let mut hash = Sha1::new();
-    hash.update(out.as_slice());
-    hash.update(&data);
-    let hash = hash.finalize();
-
-    out.extend(data);
-
-    (hash.0, out)
-}
-
-fn add_blob(data: Vec<u8>) -> io::Result<Key> {
-    let (key, contents) = make_blob(data);
-    new_object(key)?.write_all(&contents)?;
+fn add_object(kind: ObjectKind, contents: Vec<u8>) -> io::Result<Key> {
+    let (key, data) = make_object(kind, contents);
+    let key_hex = hex::encode(key);
+    let folder = get_root()?.join(".jit/objects").join(&key_hex[..2]);
+    fs::create_dir_all(&folder)?;
+    ZlibEncoder::new(
+        File::create(folder.join(&key_hex[2..]))?,
+        Default::default(),
+    )
+    .write_all(&data)?;
     Ok(key)
 }
 
